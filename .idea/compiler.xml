@@ -6,8 +6,12 @@
         <sourceOutputDir name="target/generated-sources/annotations" />
         <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
         <outputRelativeToContentRoot value="true" />
-        <module name="cache1" />
+        <module name="cache1 (2)" />
+        <module name="cache1 (1)" />
       </profile>
     </annotationProcessing>
+    <bytecodeTargetLevel>
+      <module name="cache1" target="1.8" />
+    </bytecodeTargetLevel>
   </component>
 </project>

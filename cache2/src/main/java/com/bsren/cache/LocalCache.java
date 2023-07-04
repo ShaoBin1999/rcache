@@ -1,0 +1,333 @@
+package com.bsren.cache;
+
+import com.google.common.base.Ticker;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
+import org.checkerframework.checker.nullness.qual.Nullable;
+
+import javax.annotation.Resource;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
+
+/**
+ * 1.构造参数：cache最大数量
+ * 2.实现Cache中的方法,get and put
+ * 3.expand
+ * 4.cache其他方法
+ * 5.读超时和写超时
+ */
+public class LocalCache<K, V> {
+
+    static final int MAXIMUM_CAPACITY = 1 << 30;
+
+    Ticker ticker = Ticker.systemTicker();
+
+    int maxWeight;
+
+    int segmentShift;
+
+    int segmentMask;
+
+    Segment<K, V>[] segments;
+
+    public LocalCache(int maxWeight) {
+        this.maxWeight = Math.min(MAXIMUM_CAPACITY, maxWeight);
+        int segmentShift = 0;
+        int segmentCount = 1;
+        while (segmentCount * 20 < maxWeight) {
+            segmentShift++;
+            segmentCount <<= 1;
+        }
+        this.segments = new Segment[segmentCount];
+        this.segmentShift = 32 - segmentShift;
+        this.segmentMask = segmentCount - 1;
+        int segmentCapacity = (this.maxWeight + segmentCount - 1) / segmentCount;
+        int segmentSize = 1;
+        while (segmentSize < segmentCapacity) {
+            segmentSize <<= 1;
+        }
+        for (int i = 0; i < segments.length; i++) {
+            segments[i] = createSegment(segmentSize);
+        }
+    }
+
+    private Segment<K, V> createSegment(int segmentSize) {
+        return new Segment<>(this, segmentSize);
+    }
+
+    static class Segment<K, V> extends ReentrantLock {
+
+        LocalCache<K, V> map;
+
+        int segmentWeight;
+
+        int threshold;
+
+        int count;
+
+        int modCount;
+
+        AtomicInteger readCount = new AtomicInteger();
+
+
+        AtomicReferenceArray<Entry<K, V>> table;
+
+        Segment(LocalCache<K, V> map, int initialCapacity) {
+            this.map = map;
+            this.segmentWeight = initialCapacity;
+            initTable(initialCapacity);
+        }
+
+        private void initTable(int initialCapacity) {
+            AtomicReferenceArray<Entry<K, V>> newTable = new AtomicReferenceArray<>(initialCapacity);
+            this.threshold = newTable.length() * 3 / 4;
+            this.table = newTable;
+        }
+
+        public V get(Object key, int hash) {
+            try {
+                if (count == 0) {
+                    return null;
+                }
+                AtomicReferenceArray<Entry<K, V>> table = this.table;
+                Entry<K, V> first = table.get(hash & (table.length() - 1));
+                for (Entry<K, V> e = first; e != null; e = e.getNext()) {
+                    if (e.getHash() != hash) {
+                        continue;
+                    }
+                    K entryKey = e.getKey();
+                    if (equalsKey(entryKey, key)) {
+                        Object valueReference = e.getValueReference();
+                        if (!(valueReference instanceof Value)) {
+                            recordRead(e);
+                            return (V) valueReference;
+                        }
+                        V value = ((Value<K, V>) valueReference).get();
+                        if (value != null) {
+                            recordRead(e);
+                            return value;
+                        }
+                    }
+                }
+                return null;
+            } finally {
+                postRead();
+            }
+        }
+
+        private void postRead() {
+            this.readCount.incrementAndGet();
+        }
+
+        private void recordRead(Entry<K, V> e) {
+
+        }
+
+        private boolean equalsKey(K entryKey, Object key) {
+            return entryKey.equals(key);
+        }
+
+        public V put(K key, int hash, V value) {
+            lock();
+            try {
+                int newCount = this.count;
+                if (newCount + 1 > threshold) {
+                    expand();
+                }
+                AtomicReferenceArray<Entry<K, V>> table = this.table;
+                int index = hash & (table.length() - 1);
+                Entry<K, V> first = table.get(index);
+                for (Entry<K, V> e = first; e != null; e = e.getNext()) {
+                    K entryKey = e.getKey();
+                    if (equalsKey(entryKey, key)) {
+                        Object valueReference = e.getValueReference();
+                        V entryValue = null;
+                        if (!(valueReference instanceof Value)) {
+                            entryValue = (V) valueReference;
+                        } else {
+                            entryValue = (V) ((Value) valueReference).get();
+                        }
+                        modCount++;
+                        setValue(e, key, value);
+                        this.count = newCount;
+                        return entryValue;
+                    }
+                }
+                modCount++;
+                Entry<K, V> entry = new StrongEntry<>(key, hash, first);
+                setValue(entry, key, value);
+                table.set(index, entry);
+                newCount = this.count + 1;
+                this.count = newCount;
+                return null;
+            } finally {
+                unlock();
+                postWrite();
+            }
+        }
+
+        @GuardedBy("this")
+        private void setValue(Entry<K, V> e, K key, V value) {
+            e.setValue(value);
+        }
+
+        @GuardedBy("this")
+        private void expand() {
+            AtomicReferenceArray<Entry<K, V>> oldTable = this.table;
+            int oldCapacity = oldTable.length();
+            if (oldCapacity >= MAXIMUM_CAPACITY) {
+                return;
+            }
+            int newCount = this.count;
+            AtomicReferenceArray<Entry<K, V>> newTable = new AtomicReferenceArray<>(oldCapacity << 1);
+            this.threshold = newTable.length() * 3 / 4;
+            int newMask = newTable.length() - 1;
+            for (int oldIndex = 0; oldIndex < oldCapacity; oldIndex++) {
+                Entry<K, V> head = oldTable.get(oldIndex);
+                if (head == null) {
+                    continue;
+                }
+                Entry<K, V> next = head.getNext();
+                int headIndex = head.getHash() & newMask;
+                if (next == null) {
+                    newTable.set(headIndex, head);
+                } else {
+                    Entry<K, V> tail = head;
+                    int tailIndex = headIndex;
+                    for (Entry<K, V> e = next; e != null; e = e.getNext()) {
+                        int newIndex = e.getHash() & newMask;
+                        if (newIndex != tailIndex) {
+                            tailIndex = newIndex;
+                            tail = e;
+                        }
+                    }
+                    newTable.set(tailIndex, tail);
+
+                    for (Entry<K, V> e = head; e != tail; e = e.getNext()) {
+                        int newIndex = e.getHash() & newMask;
+                        Entry<K, V> newNext = newTable.get(newIndex);
+                        Entry<K, V> newFirst = copyEntry(e, newNext);
+                        newTable.set(newIndex, newFirst);
+                    }
+                }
+            }
+            table = newTable;
+            this.count = newCount;
+        }
+
+        private Entry<K, V> copyEntry(Entry<K, V> original, Entry<K, V> newNext) {
+            return new StrongEntry<>(original.getKey(), original.getHash(), newNext);
+        }
+
+        private void postWrite() {
+
+        }
+
+        public void clear() {
+
+        }
+
+        public V remove(@Nullable Object key, int hash) {
+            lock();
+            try {
+                long now = map.ticker.read();
+                preWrite(now);
+                int newCount = this.count - 1;
+                AtomicReferenceArray<Entry<K, V>> table = this.table;
+                int index = hash & (table.length() - 1);
+                Entry<K, V> first = table.get(index);
+                for (Entry<K, V> e = first; e != null; e = e.getNext()) {
+                    K entryKey = e.getKey();
+                    if(equalsKey(entryKey,key)){
+                        Object valueReference = e.getValueReference();
+                        if(!(valueReference instanceof ValueReference)){
+                            modCount++;
+
+                        }
+                    }
+                }
+
+            } finally {
+                unlock();
+                postWrite();
+            }
+            return null;
+        }
+
+        private void preWrite(long now) {
+
+        }
+    }
+
+    public V getIfPresent(Object key) {
+        int hash = hash(key);
+        return segmentFor(hash).get(key, hash);
+    }
+
+    public V put(K key, V value) {
+        int hash = hash(key);
+        return segmentFor(hash).put(key, hash, value);
+    }
+
+
+    public void cleanUp() {
+        for (Segment<K, V> segment : segments) {
+            segment.clear();
+        }
+    }
+
+    public void putAll(Map<? extends K, ? extends V> m) {
+        for (Map.Entry<? extends K, ? extends V> e : m.entrySet()) {
+            put(e.getKey(), e.getValue());
+        }
+    }
+
+    private V remove(@Nullable Object key) {
+        if (key == null) {
+            return null;
+        }
+        int hash = hash(key);
+        return segmentFor(hash).remove(key, hash);
+    }
+
+    public void invalidateAll(Iterable<?> keys) {
+        // TODO(fry): batch by segment
+        for (Object key : keys) {
+            remove(key);
+        }
+    }
+
+    public void invalidate(Object key) {
+
+    }
+
+    public int size() {
+        int ret = 0;
+        for (Segment<K, V> segment : segments) {
+            ret += segment.count;
+        }
+        return ret;
+    }
+
+
+    Segment<K, V> segmentFor(int hash) {
+        return segments[(hash >>> segmentShift) & segmentMask];
+    }
+
+    private int hash(Object key) {
+        return rehash(key.hashCode());
+    }
+
+    static int rehash(int h) {
+        h += (h << 15) ^ 0xffffcd7d;
+        h ^= (h >>> 10);
+        h += (h << 3);
+        h ^= (h >>> 6);
+        h += (h << 2) + (h << 14);
+        return h ^ (h >>> 16);
+    }
+}
