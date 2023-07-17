@@ -4,21 +4,18 @@ import com.google.common.base.Ticker;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
-import javax.annotation.Resource;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
 
 /**
  * 1.构造参数：cache最大数量
  * 2.实现Cache中的方法,get and put
  * 3.expand
  * 4.cache其他方法
- * 5.读超时和写超时
+ * 5.读超时和写超时，读超时和写超时队列，读队列
  */
 public class LocalCache<K, V> {
 
@@ -70,6 +67,12 @@ public class LocalCache<K, V> {
         int count;
 
         int modCount;
+
+        @GuardedBy("this")
+        Queue<Entry<K,V>> writeQueue;
+
+        @GuardedBy("this")
+        Queue<Entry<K,V>> accessQueue;
 
         AtomicInteger readCount = new AtomicInteger();
 
@@ -246,7 +249,6 @@ public class LocalCache<K, V> {
                         Object valueReference = e.getValueReference();
                         if(!(valueReference instanceof ValueReference)){
                             modCount++;
-
                         }
                     }
                 }
