@@ -1,11 +1,14 @@
 package com.bsren.cache;
 
+import com.bsren.cache.queue.AccessQueue;
+import com.bsren.cache.queue.WriteQueue;
 import com.google.common.base.Ticker;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.ReentrantLock;
@@ -74,6 +77,8 @@ public class LocalCache<K, V> {
         @GuardedBy("this")
         Queue<Entry<K,V>> accessQueue;
 
+        Queue<Entry<K,V>> recencyQueue;
+
         AtomicInteger readCount = new AtomicInteger();
 
 
@@ -83,6 +88,9 @@ public class LocalCache<K, V> {
             this.map = map;
             this.segmentWeight = initialCapacity;
             initTable(initialCapacity);
+            writeQueue = new WriteQueue<>();
+            accessQueue = new AccessQueue<>();
+            recencyQueue = new ConcurrentLinkedDeque<>();
         }
 
         private void initTable(int initialCapacity) {
@@ -90,6 +98,82 @@ public class LocalCache<K, V> {
             this.threshold = newTable.length() * 3 / 4;
             this.table = newTable;
         }
+
+
+        Entry<K,V> getLiveEntry(Object key,int hash, long now){
+            Entry<K,V> e = getEntry(key,hash);
+            if(e==null){
+                return null;
+            }else if(map.isExpired(e,now)){
+                tryExpireEntries(now);
+                return null;
+            }
+            return e;
+        }
+
+        private void tryExpireEntries(long now) {
+            if(tryLock()){
+                try {
+                    expireEntries(now);
+                }finally {
+                    unlock();
+                }
+            }
+        }
+
+        @GuardedBy("this")
+        private void expireEntries(long now) {
+            drainRecencyQueue();
+            Entry<K,V> e;
+            while ((e = writeQueue.peek())!=null && map.isExpired(e,now)){
+                if(!removeEntry(e)){
+                    throw new AssertionError();
+                }
+            }
+            while ((e = accessQueue.peek())!=null && map.isExpired(e,now)){
+                if(!removeEntry(e)){
+                    throw new AssertionError();
+                }
+            }
+        }
+
+        @GuardedBy("this")
+        private boolean removeEntry(Entry<K,V> entry) {
+            int newCount = this.count-1;
+            AtomicReferenceArray<Entry<K,V>> table = this.table;
+            int index = entry.getHash() & (table.length()-1);
+            Entry<K,V> first = table.get(index);
+            for (Entry<K,V> e = first;e !=null;e = e.getNext()){
+                if(e==entry){    //比较的地址相等
+                    modCount++;
+                    Entry<K,V> newFirst = removeValueFromChain(first,e,e.getKey(),entry.getHash(),e.getValueReference());
+                    newCount = this.count-1;
+                    table.set(index,newFirst);
+                    this.count = newCount;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private Entry<K,V> removeValueFromChain(Entry<K,V> first, Entry<K,V> e, K key, int hash, Object valueReference) {
+            return null;
+        }
+
+        Entry<K,V> getEntry(Object key,int hash){
+            AtomicReferenceArray<Entry<K,V>> table = this.table;
+            int index = hash & (table.length()-1);
+            Entry<K,V> first = table.get(index);
+            for (Entry<K,V> e = first;e!=null;e = e.getNext()){
+                K entryKey = e.getKey();
+                if(equalsKey(entryKey,key)){
+                    return e;
+                }
+            }
+            return null;
+        }
+
+
 
         public V get(Object key, int hash) {
             try {
@@ -105,13 +189,14 @@ public class LocalCache<K, V> {
                     K entryKey = e.getKey();
                     if (equalsKey(entryKey, key)) {
                         Object valueReference = e.getValueReference();
+                        long now = map.ticker.read();
                         if (!(valueReference instanceof Value)) {
-                            recordRead(e);
+                            recordRead(e,now);
                             return (V) valueReference;
                         }
                         V value = ((Value<K, V>) valueReference).get();
                         if (value != null) {
-                            recordRead(e);
+                            recordRead(e,now);
                             return value;
                         }
                     }
@@ -126,8 +211,9 @@ public class LocalCache<K, V> {
             this.readCount.incrementAndGet();
         }
 
-        private void recordRead(Entry<K, V> e) {
-
+        private void recordRead(Entry<K, V> e,long time) {
+            e.setAccessTime(time);
+            recencyQueue.add(e);
         }
 
         private boolean equalsKey(K entryKey, Object key) {
@@ -144,6 +230,7 @@ public class LocalCache<K, V> {
                 AtomicReferenceArray<Entry<K, V>> table = this.table;
                 int index = hash & (table.length() - 1);
                 Entry<K, V> first = table.get(index);
+                long now = map.ticker.read();
                 for (Entry<K, V> e = first; e != null; e = e.getNext()) {
                     K entryKey = e.getKey();
                     if (equalsKey(entryKey, key)) {
@@ -155,14 +242,14 @@ public class LocalCache<K, V> {
                             entryValue = (V) ((Value) valueReference).get();
                         }
                         modCount++;
-                        setValue(e, key, value);
+                        setValue(e, key, value,now);
                         this.count = newCount;
                         return entryValue;
                     }
                 }
                 modCount++;
                 Entry<K, V> entry = new StrongEntry<>(key, hash, first);
-                setValue(entry, key, value);
+                setValue(entry, key, value,now);
                 table.set(index, entry);
                 newCount = this.count + 1;
                 this.count = newCount;
@@ -174,8 +261,26 @@ public class LocalCache<K, V> {
         }
 
         @GuardedBy("this")
-        private void setValue(Entry<K, V> e, K key, V value) {
+        private void setValue(Entry<K, V> e, K key, V value,long now) {
             e.setValue(value);
+            recordWrite(e,now);
+        }
+
+        @GuardedBy("this")
+        private void recordWrite(Entry<K,V> e, long now) {
+            drainRecencyQueue();
+            e.setAccessTime(now);
+            e.setWriteTime(now);
+            accessQueue.add(e);
+            writeQueue.add(e);
+        }
+
+        @GuardedBy("this")
+        private void drainRecencyQueue() {
+            Entry<K,V> e;
+            while ((e = recencyQueue.poll())!=null){
+                accessQueue.add(e);
+            }
         }
 
         @GuardedBy("this")
@@ -263,6 +368,10 @@ public class LocalCache<K, V> {
         private void preWrite(long now) {
 
         }
+    }
+
+    private boolean isExpired(Entry<K, V> e, long now) {
+        return false;
     }
 
     public V getIfPresent(Object key) {
